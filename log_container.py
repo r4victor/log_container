@@ -1,15 +1,16 @@
 import argparse
 import json
 import queue
-import subprocess
 import sys
 from threading import Thread
 import time
-from typing import TextIO
+from typing import Iterable
 
 import boto3
 from botocore.client import BaseClient
 import botocore.exceptions
+import docker
+import docker.errors
 
 
 SEND_LOGS_INTERVAL = 5
@@ -37,37 +38,40 @@ def log_container(
         print(e)
         exit(1)
 
-    if not docker_is_running():
-        print('Error: ensure that docker daemon is running')
+    try:
+        client = docker.from_env()
+    except docker.errors.DockerException:
+        print('Error: ensure docker daemon is running')
         exit(1)
 
-    proc = subprocess.Popen(
-        args=[
-            'docker', 'run', '--rm',
-            '-t', # Attach tty to avoid stdout buffering as in case with Python
-            '--entrypoint', 'bash', # Override --entrypoint so that we run bash for any image
-            image_name, '-c', command
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True
-    )
+    try:
+        container = client.containers.run(
+            image_name, ['bash', '-c', command], detach=True, stderr=True
+        )
+    except docker.errors.APIError as e:
+        print(e)
+        exit(1)
+
+    stdout = container.logs(stdout=True, stderr=False, stream=True)
+    stderr = container.logs(stdout=False, stderr=True, stream=True)
+    
     print('Container is running...')
 
-    # We use threads to read from stdout/stdin concurrently in a portable manner
+    # We use threads to read from stdout/stderr concurrently in a portable manner
     q = queue.Queue()
     producers = [
-        Thread(target=produce_log_messages, args=[q, proc.stdout, 'stdout', command]),
-        Thread(target=produce_log_messages, args=[q, proc.stderr, 'stderr', command]),
+        Thread(target=produce_log_messages, args=[q, stdout, 'stdout', command]),
+        Thread(target=produce_log_messages, args=[q, stderr, 'stderr', command]),
     ]
     for producer in producers:
         producer.start()
 
     death_pills_num = 0
+    total_logs_sent = 0
+    logs_batch = []
+    last_sent_time = time.time()
     try:
-        logs_batch = []
-        last_sent_time = time.time()
-        while proc.poll() is None or death_pills_num != len(producers) or len(logs_batch) > 0:
+        while container.status == 'running' or death_pills_num != len(producers) or len(logs_batch) > 0:
             try:
                 log_message = q.get(timeout=1)
             except queue.Empty:
@@ -76,11 +80,12 @@ def log_container(
                 if log_message is None:
                     death_pills_num += 1
                 else:
+                    print(log_message['data'])
                     log = {
                         # We construct timestamps in the main thread because
                         # `put_log_events` requires them to be ordered
                         'timestamp': int(time.time() * 1000),
-                        'message': log_message,
+                        'message': json.dumps(log_message),
                     }
                     logs_batch.append(log)
             if len(logs_batch) > 0 and time.time() - last_sent_time > SEND_LOGS_INTERVAL:
@@ -89,11 +94,19 @@ def log_container(
                     logStreamName=aws_cloudwatch_stream,
                     logEvents=logs_batch,
                 )
-                print(f'Sent {len(logs_batch)} logs')
+                total_logs_sent += len(logs_batch)
                 logs_batch = []
                 last_sent_time = time.time()
     except KeyboardInterrupt:
-        proc.terminate()
+        try:
+            print('Stopping container...')
+            container.stop()
+        except KeyboardInterrupt:
+            print('Killing container...')
+            container.kill()
+    container.remove()
+    print(f'Sent {total_logs_sent} logs')
+    print('Done')
 
 
 def get_logs_client(
@@ -130,18 +143,13 @@ def create_log_stream(logs_client: BaseClient, aws_cloudwatch_group: str, aws_cl
         print(f'Log stream "{aws_cloudwatch_group}" has been created')
 
 
-def docker_is_running() -> bool:
-    proc = subprocess.run(['docker', 'info'], stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
-    return proc.returncode == 0
-
-
-def produce_log_messages(q: queue.Queue, source: TextIO, source_name: str, command: str):
-    while (line := source.readline()) != '':
-        message = json.dumps({
+def produce_log_messages(q: queue.Queue, source: Iterable[bytes], source_name: str, command: str):
+    for line in source:
+        message = {
             'command': command,
             'source': source_name,
-            'data': line.rstrip('\n'),
-        })
+            'data': line.decode().rstrip('\n'),
+        }
         q.put(message)
     q.put(None)
 
